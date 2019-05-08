@@ -527,8 +527,7 @@ for (g in genreList) {
 
 ```
 
-Based on the result above, the accuracy metric varies across movie genre to be as long as 0.2857143 in "Television" and as high as 0.8333333 in "Gay and Lesbian". Such results are most likely due to the fact that there are not too many review comments about movies of "Television" or "Gay and Lesbian" genre (with 84 and 12 comments in the `test_sub` dataset, respectively) to begin with, therefore the model's prediction is somewhat by chance. When looking at the model's performance to a more common genre, for example, "Action and Adventure" (there are 5708 comments in the `test_sub` dataset), the accuracy metric of 0.6210582 is closer to the average accuracy of 0.6297. This is a reminder 
-about the importance of looking at how the model affects different subpopulation differently and the importance of having each subpopulation adequately represented in the dataset (if analyzing subpopulation is something that the research cares about).
+Based on the result above, the accuracy metric varies across movie genre to be as low as 0.2857143 in "Television" and as high as 0.8333333 in "Gay and Lesbian". Such results are most likely due to the fact that there are not too many review comments about movies of "Television" or "Gay and Lesbian" genre (with 84 and 12 comments in the `test_sub` dataset, respectively) to begin with, therefore the model's prediction is somewhat by chance (i.e., the model’s predictions on those rows have a larger variance). When looking at the model's performance to a more common genre, for example, "Action and Adventure" (there are 5708 comments in the `test_sub` dataset), the accuracy metric of 0.6210582 is closer to the average accuracy of 0.6297. This is a reminder about the importance of looking at how the model affects different subpopulation differently and the importance of having each subpopulation adequately represented in the dataset (if analyzing subpopulation is something that the research cares about).
 
 ## Next steps
 
@@ -537,7 +536,7 @@ Given more time, the following steps should be considered and implemented to imp
 - Get more context of the data (e.g. be more familiar with movie genre. movie technical terms, etc.) in other words, it is important to connect the result back to the data with content expertise.
 - Try out bi-gram and n-gram options
 - Conduct topic modeling to generate new features for model building
-- Normalizing all variables before the model
+- Normalize all variables before the model
 - Try out more models (e.g. adaboost, random forest, etc)
 
 
