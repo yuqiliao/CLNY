@@ -1,0 +1,548 @@
+---
+title: "Machine Learning Applied Task"
+author: "Yuqi Liao"
+date: "May 8, 2019"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    df_print: paged
+    toc: yes
+---
+
+## Introduction
+
+This notebook documents the workflow and the thought process in completing the machine learning applied task given by [Crime Lab New York](https://urbanlabs.uchicago.edu/labs/crime-new-york). Some logistical notes:
+
+1. The **workflow** rather than the **model accuracy** is emphasized
+2. For some code chunks, `eval`, `message`, and/or `warning` are set to `FALSE` to save time in generating the *.html* version of the notebook, and to avoid making the notebook too long. Please feel free to run the code chunk in the *.rmd* file to see the output if needed.
+
+Outline is below
+
+* Setting things up
+* Data read in
+* Clean `movie_info`
+* Clean `reviews`
+* Data join
+* Modeling
+* Next steps
+
+
+## Setting things up
+The first step is to load all the packages needed.
+
+```{r setting up, eval = TRUE, message = FALSE, warning = FALSE, results = "hide"}
+# define and load all packages
+reqpkg <- c("dplyr", "tidyverse", "tidyr", "stringr", "ggplot2", "here", "readr", "tm", "tidytext", "SnowballC", "caret", "DataExplorer", "glmnet", "naivebayes", "xgboost", "nnet", "kernlab", "lazyeval")
+
+sapply(reqpkg, function(pkgi) {
+  if (!pkgi %in% installed.packages()) {
+    install.packages(pkgi, repos = "http://cran.us.r-project.org")
+  }
+  library(pkgi, character.only = TRUE)
+})
+
+# inspect the working directory
+here()
+```
+
+
+## Data read in
+Two data sources are provided. Read them in and inspect for missing values before proceeding further.
+
+```{r data read in, eval = TRUE, message = FALSE, warning = FALSE}
+# data read in
+movie_info <- read_tsv(here("data", "movie_info.tsv"))
+reviews <- read_tsv(here("data", "reviews.tsv"))
+
+```
+
+
+```{r data inspect, eval = TRUE, message = TRUE, warning = FALSE}
+# inspect the data
+glimpse(movie_info)
+glimpse(reviews)
+
+# plot missing values
+plot_missing(movie_info)
+plot_missing(reviews) 
+```
+
+Noticed that there's a 10% missing rate in `reviews$review`. Next up, start to clean `movie_info` and `reviews` data sources respectively.
+
+
+## Clean `movie_info`
+
+Consider using `rating` (0.19% missing), `runtime` (1.92% missing), and `genre`(0.51% missing, and required by the task instruction) from `movie_info`. Start to clean these columns one by one.
+
+### `rating`
+```{r rating, eval = TRUE, message = TRUE, warning = FALSE}
+# convert into factor
+movie_info$rating <- as.factor(movie_info$rating)
+summary(movie_info$rating)
+
+# there are 3 NA cases for the `rating` variable, find out if the corresponding movie id exists in the `reviews` data set, if it does not exist, could ignore the NAs
+movie_info[is.na(movie_info$rating),]$id %in% reviews$id
+
+# turns out there's one NA case in movie_info$rating that is non-NA in reviews. therefore, try to deal with NA here. Decide to do a quick-and-dirty approach to assign NR (not rated) to the NA case
+movie_info[is.na(movie_info$rating),]$rating <- "NR"
+```
+
+### `runtime`
+```{r runtime, eval = TRUE, message = TRUE, warning = FALSE}
+# seperate `runtime` into to `runtime_minute` (double), `runtime_unit` (character)
+movie_info <- movie_info %>% 
+  separate(col = runtime, into = c("runtime_minute", "runtime_unit"), sep = " ", remove = FALSE) %>% 
+  mutate(runtime_minute = as.double(runtime_minute))
+
+# make sure `runtime_unit` is the same across all movie id (otherwise will need to convert the `runtime_minute` values accordingly)
+movie_info$runtime_unit <- as.factor(movie_info$runtime_unit)
+summary(movie_info$runtime_unit)
+summary(movie_info$runtime_minute)
+
+# there are 30 NA cases for the `runtime_minute` variable, find out if the corresponding movie id exists in the `reviews` data set, if it does not exist, could ignore the NAs
+movie_info[is.na(movie_info$runtime_minute),]$id %in% reviews$id
+
+# turns out there're a few NA cases in movie_info$runtime_minute that is non-NA in reviews. therefore, try to deal with NA here. Decide to do a quick-and-dirty approach to assign the global mean to the NA case (rational: try not to drop cases, and global mean makes sense)
+movie_info <- movie_info %>% 
+  mutate(runtime_minute = ifelse(is.na(runtime_minute), 
+                                 mean(movie_info$runtime_minute, na.rm = TRUE),
+                                 runtime_minute))
+summary(movie_info$runtime_minute)
+```
+
+### `genre`
+```{r genre, eval = TRUE, message = TRUE, warning = FALSE}
+# check for NA in movie_info$genre
+movie_info$genre <- as.factor(movie_info$genre)
+sum(is.na(movie_info$genre))
+
+# turns out there're 8 NA cases in movie_info$genre. Because it doesn't make sense to randomly assign these NA cases to a certain genre, decide to keep NA as a genre category in order not to drop any cases at this stage
+```
+
+Dummy out the `genre` column (as instructed by the task) to be used later to see how machine learning models perform on sub-groups.
+```{r genre2, eval = TRUE, message = TRUE, warning = FALSE, tidy = TRUE}
+# One-hot enconding movie_info$genre
+movie_info <- movie_info %>%
+  # seperate the genre column by "|"
+  mutate(split = str_split(genre, pattern = fixed("|"))) %>%
+  # unnest the column before further data prep
+  unnest() %>%
+  # create a new column `count` that eqauls 1 across all avaiable rows
+  mutate(count = 1) %>% 
+  # convert into wide data, and fill NA with 0 (so the value will be either 1 or 0)
+  spread(split, count, fill = 0) %>%
+  # clean the column title in case there's any empty space
+  rename_all(str_trim) %>% 
+  # rename the `<NA>` column to make it clearer
+  rename(NA_genre = `<NA>`)
+
+# check if everything looks alright
+summary(movie_info)
+```
+
+
+## Clean `reviews`
+
+Consider using `fresh`, and `review` (and create `review_id`) from `reviews`, start to clean them one by one. Specifically, for the `review` column, try to process it by applying standard tokenization process.
+
+### `fresh`
+```{r fresh, eval = TRUE, message = TRUE, warning = FALSE}
+# check 'fresh' for NA
+reviews$fresh <- as.factor(reviews$fresh)
+sum(is.na(reviews$fresh))
+```
+
+### `review`
+```{r review, eval = TRUE, message = TRUE, warning = FALSE}
+# check 'review' for NA
+sum(is.na(reviews$review))
+# there are 5563 rows (around 10%) that have no review, need to remove them before going further
+reviews <- reviews[!is.na(reviews$review),]
+```
+
+Create a new column `review_id` (so it can be used for data reshaping and data joins later).
+```{r review_id, eval = TRUE, message = TRUE, warning = FALSE}
+#'review_id' (create this column)
+reviews <- reviews %>% 
+  # define review_id so it is different than id (movie id) 
+  rownames_to_column(var = "review_id") %>% 
+  mutate(review_id = as.integer(review_id))
+```
+
+Tokenize `review`, generating `reviews_tokenized`, which is in long format.
+```{r tokenize, eval = TRUE, message = TRUE, warning = FALSE}
+# tokenize the `review` column
+reviews_tokenized <- reviews %>% 
+  # select `review_id` and `review`
+  select(review_id, review) %>% 
+  # use `unnest_tokens` to split the table into one-token-per-row. This verb automatically removes punctuation, and sets words to lower cases
+  # set `token = "words"` for now, if having more time, could experiment "ngrams" and other options
+  unnest_tokens(output = word, input = review, token = "words") %>% 
+  # remove stop words
+  anti_join(stop_words, by = "word") %>% 
+  # stemming (using `wordStem` from the `SnowballC` pakcage)
+  mutate(word = wordStem(word)) %>% 
+  # lemmatization (so words like "movie" and "film" are categorized together) - decide not to do any lemmatization, but it is something to consider in futher iterations.
+  # count frequency
+  group_by(review_id) %>% 
+  count(word) %>% 
+  rename(n_per_review = n) %>% 
+  # calculate tf, idf and tf-idf (and will use tf-idf values for modeling later)
+  bind_tf_idf(term = word, document = review_id, n = n_per_review)
+```
+
+Reshape `reviews_tokenized` into a document-term matrix, `reviews_dtm`, to be left-joined by other columns later.
+```{r tokenize2, eval = TRUE, message = TRUE, warning = FALSE}
+# reshape reviews_tokenized into document-term matrix
+reviews_dtm <- reviews_tokenized %>% 
+  cast_dtm(term = word, document = review_id, value = tf_idf)
+
+# print reviews_dtm
+reviews_dtm
+```
+
+`reviews_dtm` is a matrix that has 48816 rows and 23244 columns. Given enough computational resources and more time, one could use all 23244 columns in the model training process (if running the model in the local environment, it's likely that one needs to reset the memory limit in R by following [this thread](https://stackoverflow.com/questions/51295402/r-on-macos-error-vector-memory-exhausted-limit-reached))
+
+For this exercise, though, I will drop columns (word tokens) that are extremely infrequent. There are many ways to achieve this. One way is to filter out words/tokens that appear less than *X* times across all review comments (Could experiment with different values of *X* to find a threshold that results in a reasonable number of features) in the tokenization process above. 
+
+The other way (which I use below) is to use the verb `removeSparseTerms` directly on `reviews_dtm` to remove extremely sparse terms. This practice also makes sure that there are no near zero variance columns (which may make some models not functional in the modeling process) in the processed data set later. Setting `sparse = .999` means to drop columns/tokens that has value `0` for 99.9% of all review comments/rows, which results in 1787 words/tokens. I also try to set `sparse = .99`, which results in only 83 words/tokens. I will use the 83-word version to test out which machine learning models works the best and then use the 1787-word version to apply the two models selected.
+
+```{r less sparse, eval = TRUE, message = TRUE, warning = FALSE}
+# reducing model complexity by removing extremely sparse terms
+reviews_dtm_lessSparse <- removeSparseTerms(reviews_dtm, sparse = .999)
+reviews_dtm_lessSparse_v2 <- removeSparseTerms(reviews_dtm, sparse = .99)
+
+
+# print the less sparse models
+reviews_dtm_lessSparse
+reviews_dtm_lessSparse_v2
+```
+
+Then, convert the document-term matrix into data frames so more columns could be added later.
+```{r convert to df, eval = TRUE, message = TRUE, warning = FALSE}
+# convert dtm into simple matrix first
+reviews_matrix <- as.matrix(reviews_dtm_lessSparse)
+reviews_matrix_v2 <- as.matrix(reviews_dtm_lessSparse_v2)
+
+# convert to df (for further data processing)
+reviews_df <- data.frame(review_id = row.names(reviews_matrix), reviews_matrix) %>% 
+  mutate(review_id = as.integer(review_id))
+reviews_df_v2 <- data.frame(review_id = row.names(reviews_matrix_v2), reviews_matrix_v2) %>% 
+  mutate(review_id = as.integer(review_id))
+```
+
+
+## Data join 
+At this stage, all the pre-cleaning is done. Need to join all processed columns to create the processed data set ready for modeling.
+
+### Columns to be used from `reviews`
+```{r columns to be used from reviews, eval = TRUE, message = TRUE, warning = FALSE}
+## from reviews, select only 'fresh' (dependent variable), `review_id`, `id` (movie id)
+reviews_forLeftJoin <- reviews %>% 
+  select(fresh, review_id, id) %>% 
+  #rename fresh in case there's `fresh` in reviews_df
+  rename(fresh_outcome = fresh)
+```
+
+
+
+### Columns to be used from `movie_info`
+```{r columns to be used from movie_info, eval = TRUE, message = TRUE, warning = FALSE}
+## from movie_info, select only `review_id`, `id`, `rating`,`runtime_minute`, and all dummy-coded genre columns
+movie_info_forLeftJoin <- movie_info %>% 
+  select(-c(synopsis, genre, director, writer, theater_date, dvd_date, currency, box_office, runtime, runtime_unit, studio))
+
+# create movie_info_forLeftJoin_v2 that excludes all dummy-coded genre columns (these columns will not be input for models, but will be used later for subsetting)
+movie_info_forLeftJoin_v2 <- movie_info_forLeftJoin %>% 
+  select(id, rating, runtime_minute)
+```
+
+### Join all columns needed
+```{r Join all columns needed, eval = TRUE, message = TRUE, warning = FALSE}
+## generate the clean data set ready for data split
+processed_data <- reviews_df %>% 
+  #select(review_id) %>% 
+  left_join(reviews_forLeftJoin, by = "review_id") %>% 
+  left_join(movie_info_forLeftJoin_v2, by = "id") %>% 
+  # drop `id` (movie id) and `reveiw_id` because they won't be used for modelling
+  select(-c(id, review_id))
+
+processed_data_v2 <- reviews_df_v2 %>% 
+  #select(review_id) %>% 
+  left_join(reviews_forLeftJoin, by = "review_id") %>% 
+  left_join(movie_info_forLeftJoin_v2, by = "id") %>% 
+  # drop `id` (movie id) and `reveiw_id` because they won't be used for modelling
+  select(-c(id, review_id))
+```
+
+### Check (and remove) columns that are highly correlated with each other
+```{r highly correlated, eval = TRUE, message = TRUE, warning = FALSE, cache = TRUE}
+is_double <- sapply(processed_data, is.double)
+correlationMatrix <- cor(processed_data[, is_double])
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.99)  
+processed_dbl_removeHighlyCorr <- names(processed_data[, is_double][highlyCorrelated])
+processed_dbl_removeHighlyCorr
+
+is_double_v2 <- sapply(processed_data_v2, is.double)
+correlationMatrix_v2 <- cor(processed_data_v2[, is_double_v2])
+highlyCorrelated_v2 <- findCorrelation(correlationMatrix_v2, cutoff=0.99)  
+processed_dbl_removeHighlyCorr_v2 <- names(processed_data_v2[, is_double_v2][highlyCorrelated_v2])
+processed_dbl_removeHighlyCorr_v2
+```
+
+Since there are no variable pairs that are highly correlated with each other,  there's no need to drop any columns further. By now, `processed_data` (1790 variables) and `processed_data_v2` (86 variables) are ready to for the modelling process. Conventionally, the data preprocessing steps also include standardizing/normalizing all input variables. Given that the majority of the input variables are already on the same scale (the tf-idf values for each word/token), I decided to skip this step.
+
+### Sanity checks - check if y is balanced
+```{r sanity checks y, eval = TRUE, message = TRUE, warning = FALSE}
+## sanity checks - check if y is balanced
+summary(processed_data$fresh_outcome) 
+summary(processed_data_v2$fresh_outcome) 
+```
+`fresh_outcome` is not too un-balanced, so not doing anything further here. Given the breakdown, it is reasonable to use "accuracy" (used for this exercise) or "balanced accuracy" or as the model evaluation metrics.
+
+### Sanity checks - check the NA rate for each variable
+```{r sanity checks NA, eval = TRUE, message = TRUE, warning = FALSE}
+sum(is.na(processed_data))
+sum(is.na(processed_data_v2))
+```
+
+turns out there is no NA in the `processed_data` and `processed_data_v2` (which is expected). If for some reason the above is not zero, use the following script to investigate further.
+```{r sanity checks NA2, eval = TRUE, message = TRUE, warning = FALSE}
+# colMeans(is.na(processed_data)) %>% 
+#   sort(decreasing = TRUE) %>% 
+#   print()
+```
+
+
+## Modeling
+### 1. Data split
+```{r data split, eval = TRUE, message = TRUE, warning = FALSE}
+# set seed for reproducibility 
+set.seed(817)
+
+# split the data with the conventional 5:5 ratio
+trainingIndex <- createDataPartition(processed_data$fresh_outcome, p = 0.5, list = FALSE)
+training <- processed_data[trainingIndex, ]
+test <- processed_data[-trainingIndex, ]
+
+trainingIndex_v2 <- createDataPartition(processed_data_v2$fresh_outcome, p = 0.5, list = FALSE)
+training_v2 <- processed_data_v2[trainingIndex_v2, ]
+test_v2 <- processed_data_v2[-trainingIndex_v2, ]
+```
+
+
+### 2. Try out a few machine learning models to see which performs the best
+Given that this is a classification problem, I plan to test out the following models on `processed_data_v2` (86 variables). I selected these models because they all can solve classification problems and they vary in their style (e.g. some models are linear, some models are polynomial, etc. ).
+
+* **elastic net** (from the `glmnet` library)
+* **neural network** (from the `nnet` library)
+* **naive bayes** (from the `naivebayes` library)
+* **support vector machines with polynomial kernel** (from the `kernlab` library)
+
+The code for testing out the performance of these models is below. In a standard workflow, I will choose the two (as required by the task) top performed models to be applied on `processed_data` (1790 variables). However, giving the time constraint, and as a quick-and-dirty approach, I will choose **elastic net** and **naive bayes** models to be applied `processed_data` because (1) they are both faster than the remaining models, (2) elastic net (which is based on the logistic regression) is a good foundational classification model, (3) naive bayes is typically used in the context of text analysis modeling.
+
+#### Define function
+```{r function for model, eval = FALSE, message = TRUE, warning = FALSE}
+# Define a function for building machine learning models
+model <- function(y, trainingData, testData, methodName, tunelgth = 5, positive, ...){
+  # set seed
+  set.seed(817)
+  # train model, using "Accuracy" as the metric
+  m <- caret::train(form =  formula(paste0(y , " ~.")),
+                    data = trainingData,
+                    method = methodName,
+                    metric = "Accuracy",
+                    trControl=trainControl(method="cv", number=5),
+                    tuneLength = tunelgth) 
+  
+  #output model result
+  assign(paste0(methodName), m, envir = .GlobalEnv)
+  #get prediction and output confusion matrix
+  p <- predict(m, testData)
+  
+  # get confusion matrix by applying the trained model to the text data
+  cm <- confusionMatrix(table(p , testData[ , y] ), positive = positive)
+  assign(paste0(methodName, "_cm"), cm, envir = .GlobalEnv)
+  
+}
+```
+
+#### Loop through models
+```{r loop through models, eval = FALSE, message = TRUE, warning = FALSE, cache = TRUE}
+# define the list of models to test
+modelList <- c("glmnet", "nnet", "naive_bayes", "svmPoly")
+
+# loop through all models
+for (m in modelList){
+  print(m)
+  print(Sys.time())
+  model(y = "fresh_outcome",
+        trainingData = training_v2,
+        testData = test_v2,
+        methodName = m,
+        tunelgth = 5,
+        positive = "fresh")
+}
+Sys.time()
+```
+
+#### Compare results
+```{r compare, eval = FALSE, message = TRUE, warning = FALSE}
+
+# put all confusion matrix in one list object
+allResults <- list(glmnet_cm,
+                  nnet_cm, 
+                  naive_bayes_cm,
+                  svmPoly_cm)
+# Compare the results of all models in terms of "accuracy"
+for (i in 1:length(allResults)){
+  print(paste0("The metric for the ", i, "th model"))
+  temp <- allResults[[i]]$overall["Accuracy"]
+  print(temp)
+}
+
+# Compare the results of all models in terms of "Balanced Accuracy"
+# for (i in 1:length(allResults)){
+#   temp <- allResults[[i]]$byClass["Balanced Accuracy"]
+#   print(temp)
+# }
+```
+
+
+### 3. Build and evaluate two selected models
+As mentioned above, it is decided to apply **elastic net** and **naive bayes** models to `processed_data`.
+
+#### Elastic net
+```{r glmnet, eval = TRUE, message = TRUE, warning = FALSE, cache = TRUE}
+glmnet <- train(fresh_outcome~., 
+            data=training, 
+            method="glmnet", 
+            metric="Accuracy", 
+            trControl=trainControl(method="cv", number=5),
+            tuneLength = 5)
+print(glmnet)
+
+test_pred_glmnet <- predict(glmnet, test)
+result_glmnet <- confusionMatrix(table(test_pred_glmnet , test$fresh_outcome ), positive = "fresh")
+result_glmnet
+```
+
+#### Naive Bayes
+```{r naive_bayes, eval = TRUE, message = TRUE, warning = FALSE, cache = TRUE}
+naive_bayes <- train(fresh_outcome~., 
+            data=training, 
+            method="naive_bayes", 
+            metric="Accuracy", 
+            trControl=trainControl(method="cv", number=5),
+            tuneLength = 5)
+print(naive_bayes)
+
+test_pred_naive_bayes <- predict(naive_bayes, test)
+result_naive_bayes <- confusionMatrix(table(test_pred_naive_bayes , test$fresh_outcome), positive = "fresh")
+result_naive_bayes
+```
+
+In comparing `result_glmnet` and `result_naive_bayes`, I find that the elastic net performs better on the key metric, accuracy.
+
+### 4. Focusing on elastic net, explore variable importance
+
+The next step is to find out which variables (words/tokens) contribute the most in predicting whether the review comment is fresh or not. Using the `varImp` verb, variable importance information (standardized to be from 0 to 100) is stored and ranked. I printed out the top 20 variables below.
+
+```{r var imp, eval = TRUE, message = TRUE, warning = FALSE}
+
+# Store variable importance information in `varimp`
+varimp <- varImp(glmnet)
+# Convert to a data frame
+varimp_df <- as.data.frame(varimp$importance)
+rname <- rownames(varimp_df)
+rownames(varimp_df) <- NULL
+varimp_df <- cbind(rname, varimp_df)
+colnames(varimp_df) <- c("variable", "importance")
+
+# rank `varimp_df` by the `importance` column
+varimp_df <- varimp_df %>% 
+  dplyr::arrange(desc(importance))
+
+# Print out the top 20 variables
+varimp_df[1:20, ]
+```
+
+Going through this list of variable names (Note that they have been processed in various steps, including stemming. One can use [this link](http://snowball.tartarus.org/algorithms/porter/diffs.txt) as a reference to map a stemmed word back to its orginal state), some interesting patterns jump out.
+
+* Some names are highly predictive of the outcome of interest (fresh or not), such as "lee.", "cage", "ralph", "william" (which could be the name of the producer, director, or actor/actress, etc.)
+* Some words that indicate sentiment  (e.g. "fortun" that comes from words like "fortunate" or "fortunately"; "exhilar" that comes from "exhilarated") are also highly predictive of the outcome.
+
+
+
+### 5. Focusing on elastic net, explore its performance in subpopulation
+To explore whether the performance of the model difference across subpopulations in the data (as required by the task), I focused on applying the trained elastic net model to a subset of review comments by each genre.
+
+#### Subset the text dataset by genre
+Earlier when generating `processed_data`, I used `movie_info_forLeftJoin_v2` and I dropped the `review_id` column. Now, try to redo it so that `processed_data_v3` has all genre columns and the `review_id` column. After it, I can generate `test_v3` which is essentially a subset of `test` but with the additional genre and `review_id` columns.
+
+```{r sub group, eval = TRUE, message = TRUE, warning = FALSE}
+# generate `processed_data_v3`
+processed_data_v3 <- reviews_df %>% 
+  #select(review_id) %>% 
+  left_join(reviews_forLeftJoin, by = "review_id") %>% 
+  left_join(movie_info_forLeftJoin, by = "id") %>% 
+  # drop `id` (movie id) and keep `reveiw_id`
+  select(-c(id))
+
+# recreate the `test` object using `trainingIndex`
+test_v3 <- processed_data_v3[-trainingIndex, ]
+```
+
+#### Apply the model to each subset and print out the accuracy metric
+Next, I loop through all genre columns (as a filter) to subset the `test_v3` data, and to apply and evaluate the elastic net model. The accuracy metrics for each run is printed below.
+
+```{r sub group2, eval = TRUE, message = TRUE, warning = FALSE}
+# Define the list of genre (except for the first three columns of `movie_info_forLeftJoin`, all columns are genre types)
+genreList <- colnames(movie_info_forLeftJoin)[-(1:3)]
+
+# loop through `genreList` to apply the tuned model on various test subsets
+for (g in genreList) {
+
+  test_sub <- test_v3 %>% 
+    # filter by values in the column g
+    filter_(interp(~v==1, v=as.name(g))) %>% 
+    # drop all genre-related columns
+    select(-one_of(genreList)) %>% 
+    # drop `review_id`
+    select(-review_id)
+  
+  # apply the tuned model on `test_sub`
+  p <- predict(glmnet, test_sub)
+
+  # generate confusion matrix
+  cm <- confusionMatrix(table(p , test_sub$fresh_outcome), positive = "fresh")
+  # assign(paste0(str_replace_all(g,"\\s","_"), "_cm"), cm, envir = .GlobalEnv)
+  
+  # print out the confusion matrix metric, Accuracy, for each model
+  print(paste0("Genre: ", g))
+  print(cm$overall["Accuracy"])
+}
+
+```
+
+Based on the result above, the accuracy metric varies across movie genre to be as long as 0.2857143 in "Television" and as high as 0.8333333 in "Gay and Lesbian". Such results are most likely due to the fact that there are not too many review comments about movies of "Television" or "Gay and Lesbian" genre (with 84 and 12 comments in the `test_sub` dataset, respectively) to begin with, therefore the model's prediction is somewhat by chance. When looking at the model's performance to a more common genre, for example, "Action and Adventure" (there are 5708 comments in the `test_sub` dataset), the accuracy metric of 0.6210582 is closer to the average accuracy of 0.6297. This is a reminder 
+about the importance of looking at how the model affects different subpopulation differently and the importance of having each subpopulation adequately represented in the dataset (if analyzing subpopulation is something that the research cares about).
+
+## Next steps
+
+Given more time, the following steps should be considered and implemented to improve the performance of the model and to understand better of the implication of the model.
+
+- Get more context of the data (e.g. be more familiar with movie genre. movie technical terms, etc.) in other words, it is important to connect the result back to the data with content expertise.
+- try out bi-gram and n-gram options
+- conduct topic modeling to generate new features for model building
+- normalizing all variables before the model
+- try out more models (e.g. adaboost, random forest, etc)
+
+
+
+
+
+
+
